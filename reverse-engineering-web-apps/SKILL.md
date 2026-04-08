@@ -25,15 +25,46 @@ Live apps leak their own internals: network requests expose DB schema, localStor
 ## The Workflow
 
 ```
-Static files → Screenshot UI → Try DOM → Pivot to Network → localStorage → API calls → Compile
+Auth → Static files → Source maps → Screenshot UI → Try DOM → Pivot to Network → localStorage + IndexedDB → WebSocket → API calls → Compile
+```
+
+### Phase 0 — Auth (if app is behind login)
+
+You need a real session before anything else works. Options in order of preference:
+
+```js
+// Playwright: automate login and persist session
+await page.goto('https://app.target.com/login')
+await page.fill('[name=email]', 'user@target.com')
+await page.fill('[name=password]', 'password')
+await page.click('[type=submit]')
+await page.waitForURL('**/dashboard')
+await page.context().storageState({ path: 'session.json' })
+
+// Reuse session in subsequent runs:
+// browser_navigate with context loaded from session.json
+```
+
+If you have a token but no browser session:
+```bash
+# Set cookie manually via evaluate after navigation
+document.cookie = "auth_token=eyJ...; path=/"
+localStorage.setItem('sb-PROJECT-auth-token', JSON.stringify({access_token:'eyJ...'}))
+location.reload()
 ```
 
 ### Phase 1 — Static Recon (no browser needed)
 
 ```bash
+# Source map leak — check FIRST, exposes full source if present
+BUNDLE=$(curl -sk https://app.target.com | grep -o 'assets/index-[^"]*\.js' | head -1)
+curl -sk "https://app.target.com/${BUNDLE}.map" | jq '.sources[:10]'
+# If it returns file paths → full source available. Extract with: source-map-cli
+
 # If you have extracted files (bundle, APK, electron app):
 rg -o '"[a-z_]+\.[a-z]+\.co/[^"]*"' bundle.js   # extract URLs
 rg -o 'eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+' bundle.js  # JWTs/keys
+rg -oE 'REACT_APP_\w+=\S+' bundle.js              # exposed env vars
 ```
 
 Fetch known public assets from the live app:
@@ -88,12 +119,20 @@ From network requests, extract:
 - **RPC/function names** (e.g. `/rpc/record_daily_visit`)
 - **GraphQL operations** (operation names reveal business logic)
 
-### Phase 5 — localStorage Extraction
+```bash
+# GraphQL introspection — always try, even if not obviously GraphQL
+curl -sk -X POST https://api.target.com/graphql \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"query":"{ __schema { types { name fields { name type { name } } } } }"}' \
+  | jq '.data.__schema.types[] | select(.fields != null) | {name, fields: [.fields[].name]}'
+# Returns full schema: every type, every field, every relationship
+```
 
-Client-side state in localStorage is the richest source of **data model** info:
+### Phase 5 — localStorage + IndexedDB Extraction
 
 ```js
-// Dump all keys and parse JSON values:
+// localStorage — dump all keys and parse JSON values:
 Object.fromEntries(
   Object.keys(localStorage).map(k => {
     try { return [k, JSON.parse(localStorage.getItem(k))] }
@@ -107,6 +146,41 @@ Look for:
 - Cached API responses (reveal full object schema)
 - Feature flags, user config, design state
 - Session/analytics metadata
+
+```js
+// IndexedDB — apps using Firebase, PouchDB, Dexie, or Supabase offline
+// store full data models here; localStorage alone misses this
+const dbs = await indexedDB.databases()
+// → [{name: 'firebaseLocalStorageDb', version: 1}, ...]
+
+// Read a specific store:
+const req = indexedDB.open('firebaseLocalStorageDb')
+req.onsuccess = e => {
+  const db = e.target.result
+  const tx = db.transaction(db.objectStoreNames[0], 'readonly')
+  tx.objectStore(db.objectStoreNames[0]).getAll().onsuccess = e => console.log(e.target.result)
+}
+```
+
+### Phase 5b — WebSocket Traffic
+
+```js
+// Playwright MCP doesn't capture WS frames natively.
+// Intercept at the JS level before navigating:
+const wsMessages = []
+const OrigWS = window.WebSocket
+window.WebSocket = function(...args) {
+  const ws = new OrigWS(...args)
+  ws.addEventListener('message', e => wsMessages.push({dir:'in', data:e.data, ts:Date.now()}))
+  const origSend = ws.send.bind(ws)
+  ws.send = function(data) { wsMessages.push({dir:'out', data, ts:Date.now()}); origSend(data) }
+  return ws
+}
+// After interacting with the app:
+console.log(JSON.stringify(wsMessages.slice(-20), null, 2))
+```
+
+WS messages reveal: realtime DB schema (Supabase Realtime), presence channels, feature events, and server-push data structures.
 
 ### Phase 6 — Direct API Calls with Real Credentials
 
